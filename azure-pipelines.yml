@@ -1,0 +1,290 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# azure-pipelines.yml — CI/CD del Agente Conversacional
+# Mismo patrón de ramas que Etapa 4:
+#   feature/* → integration_dev → main
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - integration_dev
+  paths:
+    exclude:
+      - docs/**
+      - "*.md"
+
+pr:
+  branches:
+    include:
+      - integration_dev
+      - main
+
+# ── Variables de grupo (configurar en Azure DevOps Library) ──────────────────
+# Crear Variable Group "agent-variables" con:
+#   ACR_SERVER, ACR_USERNAME, ACR_PASSWORD
+#   CONTAINER_APP_NAME, CONTAINER_APP_RG, CONTAINER_APP_ENV
+#   AZURE_SERVICE_CONNECTION, ACR_SERVICE_CONNECTION
+variables:
+  - group: agent-variables
+  - name: IMAGE_NAME
+    value: "agent-conversational"
+  - name: DOCKERFILE_PATH
+    value: "Dockerfile"
+  - name: CONFIG_PATH
+    value: "config/config_agent.yaml"
+  - name: PYTHON_VERSION
+    value: "3.11"
+
+# ── Stages ───────────────────────────────────────────────────────────────────
+stages:
+
+  # ──────────────────────────────────────────
+  # Stage 1: Validación (feature/* + integration_dev + main)
+  # ──────────────────────────────────────────
+  - stage: Validate
+    displayName: "Validación de calidad"
+    jobs:
+      - job: QualityChecks
+        displayName: "Checks: deps, seguridad, cobertura"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+
+          - script: pip install -r requirements.txt
+            displayName: "Instalar dependencias"
+
+          # Verificar dependencias desactualizadas o con vulnerabilidades
+          - script: pip install pip-audit && pip-audit
+            displayName: "Auditoría de dependencias (pip-audit)"
+            continueOnError: true
+
+          # Detectar endpoints, keys y secrets hardcodeados
+          - script: |
+              echo "Buscando secrets hardcodeados..."
+              grep -rn \
+                -e "api_key\s*=\s*['\"][^$]" \
+                -e "password\s*=\s*['\"][^$]" \
+                -e "secret\s*=\s*['\"][^$]" \
+                --include="*.py" src/ || echo "Sin secrets hardcodeados detectados"
+            displayName: "Validar: sin secrets hardcodeados"
+
+          # Tests con cobertura mínima del 80%
+          - script: |
+              pip install pytest pytest-asyncio pytest-cov
+              pytest tests/unit/ \
+                --cov=src \
+                --cov-report=xml:coverage.xml \
+                --cov-report=term-missing \
+                --cov-fail-under=80 \
+                -v
+            displayName: "Tests unitarios + cobertura ≥ 80%"
+
+          - task: PublishCodeCoverageResults@1
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: coverage.xml
+            displayName: "Publicar reporte de cobertura"
+
+
+  # ──────────────────────────────────────────
+  # Stage 2: Build & Push imagen Docker
+  # Solo en integration_dev y main
+  # ──────────────────────────────────────────
+  - stage: Build
+    displayName: "Build & Push imagen ACR"
+    dependsOn: Validate
+    condition: |
+      and(
+        succeeded(),
+        or(
+          eq(variables['Build.SourceBranch'], 'refs/heads/integration_dev'),
+          eq(variables['Build.SourceBranch'], 'refs/heads/main')
+        )
+      )
+    jobs:
+      - job: BuildAndPush
+        displayName: "Docker build → ACR"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: Docker@2
+            displayName: "Login a ACR"
+            inputs:
+              command:            login
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+
+          - task: Docker@2
+            displayName: "Build imagen"
+            inputs:
+              command:            build
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              repository:        $(IMAGE_NAME)
+              dockerfile:        $(DOCKERFILE_PATH)
+              tags: |
+                $(Build.BuildId)
+                latest
+
+          - task: Docker@2
+            displayName: "Push imagen a ACR"
+            inputs:
+              command:            push
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              repository:        $(IMAGE_NAME)
+              tags: |
+                $(Build.BuildId)
+                latest
+
+          # Guardar BuildId para el stage de despliegue
+          - script: echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(Build.BuildId)"
+            name: SetImageTag
+            displayName: "Exportar IMAGE_TAG"
+
+
+  # ──────────────────────────────────────────
+  # Stage 3: Deploy a Integration (integration_dev)
+  # ──────────────────────────────────────────
+  - stage: DeployIntegration
+    displayName: "Deploy → Integration"
+    dependsOn: Build
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/integration_dev')
+      )
+    jobs:
+      - deployment: DeployToIntegration
+        displayName: "Deploy agente a Container Apps (Integration)"
+        environment: "integration"
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Deploy a Container Apps"
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType:        bash
+                    scriptLocation:    inlineScript
+                    inlineScript: |
+                      az containerapp update \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(CONTAINER_APP_RG) \
+                        --image $(ACR_SERVER)/$(IMAGE_NAME):$(Build.BuildId)
+
+                - task: AzureCLI@2
+                  displayName: "Health check post-deploy"
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType:        bash
+                    scriptLocation:    inlineScript
+                    inlineScript: |
+                      APP_URL=$(az containerapp show \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(CONTAINER_APP_RG) \
+                        --query "properties.configuration.ingress.fqdn" -o tsv)
+
+                      echo "Health check en https://$APP_URL/health"
+
+                      # Reintentar hasta 10 veces con 12s de espera (2 min total)
+                      for i in $(seq 1 10); do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                          https://$APP_URL/health)
+                        echo "Intento $i: HTTP $STATUS"
+                        if [ "$STATUS" = "200" ]; then
+                          echo "Health check exitoso"
+                          exit 0
+                        fi
+                        sleep 12
+                      done
+                      echo "Health check falló después de 2 minutos"
+                      exit 1
+
+
+  # ──────────────────────────────────────────
+  # Stage 4: Deploy a Producción (main) con rollback automático
+  # ──────────────────────────────────────────
+  - stage: DeployProduction
+    displayName: "Deploy → Producción"
+    dependsOn: Build
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: DeployToProduction
+        displayName: "Deploy agente a Container Apps (Producción)"
+        environment: "production"    # Requiere aprobación manual en Azure DevOps
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Guardar revisión actual (rollback)"
+                  name: SaveRevision
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType:        bash
+                    scriptLocation:    inlineScript
+                    inlineScript: |
+                      CURRENT=$(az containerapp revision list \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(CONTAINER_APP_RG) \
+                        --query "[?properties.active].name | [0]" -o tsv)
+                      echo "Revisión activa actual: $CURRENT"
+                      echo "##vso[task.setvariable variable=PREV_REVISION]$CURRENT"
+
+                - task: AzureCLI@2
+                  displayName: "Deploy a Container Apps (Producción)"
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType:        bash
+                    scriptLocation:    inlineScript
+                    inlineScript: |
+                      az containerapp update \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(CONTAINER_APP_RG) \
+                        --image $(ACR_SERVER)/$(IMAGE_NAME):$(Build.BuildId)
+
+                - task: AzureCLI@2
+                  displayName: "Health check + Rollback automático si falla"
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType:        bash
+                    scriptLocation:    inlineScript
+                    inlineScript: |
+                      APP_URL=$(az containerapp show \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(CONTAINER_APP_RG) \
+                        --query "properties.configuration.ingress.fqdn" -o tsv)
+
+                      for i in $(seq 1 10); do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                          https://$APP_URL/health)
+                        echo "Intento $i: HTTP $STATUS"
+                        if [ "$STATUS" = "200" ]; then
+                          echo "Deploy exitoso"
+                          exit 0
+                        fi
+                        sleep 12
+                      done
+
+                      # ── ROLLBACK ────────────────────────────────────────────
+                      echo "Health check falló — ejecutando rollback a $(PREV_REVISION)"
+                      az containerapp revision activate \
+                        --revision $(PREV_REVISION) \
+                        --resource-group $(CONTAINER_APP_RG)
+                      az containerapp ingress traffic set \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(CONTAINER_APP_RG) \
+                        --revision-weight $(PREV_REVISION)=100
+                      echo "Rollback completado"
+                      exit 1
